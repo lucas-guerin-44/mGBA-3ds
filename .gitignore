@@ -4,7 +4,7 @@
 *.pyc
 
 /.claude
-
+/archive
 /build
 /build-*
 /.vs

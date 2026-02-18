@@ -4,7 +4,7 @@
 Usage: python serve.py <build_dir> [port]
   e.g. python serve.py mgba/build6 8084
 """
-import sys, os, socket, http.server, socketserver
+import sys, os, socket, http.server, socketserver, threading
 
 if len(sys.argv) < 2:
     print(f"Usage: {sys.argv[0]} <build_dir> [port]")
@@ -36,7 +36,14 @@ except ImportError:
 
 print(f"URL: {url}")
 os.chdir(build_dir)
-handler = http.server.SimpleHTTPRequestHandler
-httpd = socketserver.TCPServer(("0.0.0.0", port), handler)
+
+class OneShotHandler(http.server.SimpleHTTPRequestHandler):
+    def finish(self):
+        super().finish()
+        if self.command == "GET" and self.path == "/mgba.cia":
+            threading.Thread(target=self.server.shutdown).start()
+
+httpd = socketserver.TCPServer(("0.0.0.0", port), OneShotHandler)
 print(f"Serving {build_dir} on port {port}...")
 httpd.serve_forever()
+print("Download complete, shutting down.")

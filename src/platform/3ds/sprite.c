@@ -4,7 +4,9 @@
  *            -> palette apply (RGB555->GPU_RGBA8) -> Morton-order into C3D_Tex
  *            -> draw via ctrActivateTexture + ctrAddRectEx
  *
- * FireRed US v1.0 only. Texture is cached and only re-decoded on species change.
+ * FireRed US v1.0 only.
+ * Multi-slot cache: up to 8 species decoded simultaneously (enough for
+ * a 6-member party sidebar + detail view without per-frame re-decoding).
  */
 
 #include "sprite.h"
@@ -21,10 +23,13 @@
 #define BPP4_TILE_BYTES 32                /* 8*8 / 2 */
 #define MAX_DECOMP     4096               /* 64*64*0.5 = 2048, margin for safety */
 
-/* --- Texture cache --- */
-static C3D_Tex  sSpriteTex;
-static int      sTexInited  = 0;
-static uint16_t sCachedSpecies = 0;
+/* --- Multi-slot sprite texture cache --- */
+#define SPRITE_CACHE_SIZE 8
+
+static C3D_Tex  sSpriteTex[SPRITE_CACHE_SIZE];
+static uint16_t sCachedSpecies[SPRITE_CACHE_SIZE];
+static int      sTexInited[SPRITE_CACHE_SIZE];
+static int      sNextEvict = 0;
 
 /* --- Solid-color rectangle support (8x8 white texture) --- */
 static C3D_Tex  sWhiteTex;
@@ -106,9 +111,9 @@ static inline uint32_t texOffset(int x, int y, int texW) {
 }
 
 /* ===================================================================
- *  Decode sprite from ROM and upload to C3D_Tex
+ *  Decode sprite from ROM into a specific cache slot
  * =================================================================== */
-static int decodeSprite(const uint8_t* rom, uint16_t species) {
+static int decodeSpriteSlot(const uint8_t* rom, uint16_t species, int slot) {
 	uint32_t sprPtr, palPtr;
 	uint32_t sprOff, palOff;
 	uint8_t decomp[MAX_DECOMP];
@@ -160,15 +165,15 @@ static int decodeSprite(const uint8_t* rom, uint16_t species) {
 		           | ((uint32_t)b <<  8) | 0xFF;
 	}
 
-	/* Init texture once (64x64, RGBA8, linear RAM for CPU writes) */
-	if (!sTexInited) {
-		C3D_TexInit(&sSpriteTex, SPRITE_DIM, SPRITE_DIM, GPU_RGBA8);
-		C3D_TexSetFilter(&sSpriteTex, GPU_NEAREST, GPU_NEAREST);
-		sTexInited = 1;
+	/* Init texture for this slot (64x64, RGBA8) */
+	if (!sTexInited[slot]) {
+		C3D_TexInit(&sSpriteTex[slot], SPRITE_DIM, SPRITE_DIM, GPU_RGBA8);
+		C3D_TexSetFilter(&sSpriteTex[slot], GPU_NEAREST, GPU_NEAREST);
+		sTexInited[slot] = 1;
 	}
 
 	/* Clear texture to transparent */
-	texData = (uint32_t*)sSpriteTex.data;
+	texData = (uint32_t*)sSpriteTex[slot].data;
 	memset(texData, 0, SPRITE_DIM * SPRITE_DIM * 4);
 
 	/* Convert 4bpp GBA tiles -> palette-applied GPU_RGBA8 pixels in Morton order.
@@ -200,31 +205,55 @@ static int decodeSprite(const uint8_t* rom, uint16_t species) {
 	/* Flush CPU data cache so the GPU sees updated texture */
 	GSPGPU_FlushDataCache(texData, SPRITE_DIM * SPRITE_DIM * 4);
 
-	sCachedSpecies = species;
+	sCachedSpecies[slot] = species;
 	return 1;
 }
 
 /* ===================================================================
- *  Public: draw sprite at screen position
+ *  Cache lookup: find existing slot or decode into a new one
  * =================================================================== */
-void drawPokemonSprite(const uint8_t* rom, uint16_t species,
-                       int x, int y, int scale) {
-	int w, h;
+static C3D_Tex* findOrDecode(const uint8_t* rom, uint16_t species) {
+	int i;
 
-	if (species == 0 || species >= romprofileGet()->speciesCount) return;
-	if (scale < 1) scale = 1;
-
-	/* Re-decode only when species changes */
-	if (!sTexInited || species != sCachedSpecies) {
-		if (!decodeSprite(rom, species)) return;
+	/* Check cache for existing decode */
+	for (i = 0; i < SPRITE_CACHE_SIZE; i++) {
+		if (sTexInited[i] && sCachedSpecies[i] == species)
+			return &sSpriteTex[i];
 	}
 
-	w = SPRITE_DIM * scale;
-	h = SPRITE_DIM * scale;
+	/* Find first empty slot */
+	for (i = 0; i < SPRITE_CACHE_SIZE; i++) {
+		if (!sTexInited[i]) {
+			if (decodeSpriteSlot(rom, species, i))
+				return &sSpriteTex[i];
+			return NULL;
+		}
+	}
+
+	/* All slots full — evict round-robin */
+	i = sNextEvict;
+	sNextEvict = (sNextEvict + 1) % SPRITE_CACHE_SIZE;
+	if (decodeSpriteSlot(rom, species, i))
+		return &sSpriteTex[i];
+	return NULL;
+}
+
+/* ===================================================================
+ *  Public: draw sprite at screen position with arbitrary size
+ * =================================================================== */
+void drawPokemonSprite(const uint8_t* rom, uint16_t species,
+                       int x, int y, int w, int h) {
+	C3D_Tex* tex;
+
+	if (species == 0 || species >= romprofileGet()->speciesCount) return;
+	if (w <= 0 || h <= 0) return;
+
+	tex = findOrDecode(rom, species);
+	if (!tex) return;
 
 	/* Bind sprite texture and emit one textured quad.
 	 * The batch system handles texture switches and flushing. */
-	ctrActivateTexture(&sSpriteTex);
+	ctrActivateTexture(tex);
 	ctrAddRectEx(0xFFFFFFFF,                        /* color: white (no tint) */
 	             (s16)x, (s16)(y + h),               /* screen pos (bottom-left, negative h draws upward) */
 	             (s16)w, (s16)(-h),                   /* screen size (negative h = flip Y for correct orientation) */
@@ -234,11 +263,15 @@ void drawPokemonSprite(const uint8_t* rom, uint16_t species,
 }
 
 void spriteFree(void) {
-	if (sTexInited) {
-		C3D_TexDelete(&sSpriteTex);
-		sTexInited = 0;
-		sCachedSpecies = 0;
+	int i;
+	for (i = 0; i < SPRITE_CACHE_SIZE; i++) {
+		if (sTexInited[i]) {
+			C3D_TexDelete(&sSpriteTex[i]);
+			sTexInited[i] = 0;
+			sCachedSpecies[i] = 0;
+		}
 	}
+	sNextEvict = 0;
 	if (sWhiteInited) {
 		C3D_TexDelete(&sWhiteTex);
 		sWhiteInited = 0;

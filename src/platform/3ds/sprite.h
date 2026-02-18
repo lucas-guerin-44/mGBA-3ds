@@ -13,10 +13,13 @@
  * rom:     pointer to GBA ROM data
  * species: species ID (1-411)
  * x, y:    top-left screen position
- * scale:   integer scale factor (1 = native 64x64)
+ * w, h:    draw size in pixels (native sprite is 64x64)
+ *
+ * Supports a multi-slot cache — up to 8 species can be decoded
+ * simultaneously without re-decompression (enough for 6 party + margin).
  */
 void drawPokemonSprite(const uint8_t* rom, uint16_t species,
-                       int x, int y, int scale);
+                       int x, int y, int w, int h);
 
 /* Draw a filled rectangle. Color is ABGR (0xAABBGGRR). */
 void drawRect(int x, int y, int w, int h, uint32_t abgrColor);

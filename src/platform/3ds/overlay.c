@@ -4,7 +4,9 @@
  * Species/move names are decoded from ROM tables at runtime.
  * Sprites are decoded from ROM via sprite.c (LZ77 + 4bpp tiles).
  *
- * ZR/ZL cycles through party members.
+ * Layout: main detail panel (left) + team sidebar (right, 48px).
+ * ZR/ZL or sidebar tap cycles through party members.
+ * Tap stats panel to toggle between stats and IV/EV display.
  */
 
 #include "overlay.h"
@@ -38,15 +40,26 @@
 #define UI_PANEL    0xD0231919  /* #191923 dark charcoal, slightly transparent */
 #define UI_BORDER   0xFF585050  /* #505058 gray border */
 #define UI_ACCENT   0xFF686060  /* #606068 lighter gray accent */
+#define UI_SEL_BG   0xD0302828  /* selected cell background */
+
+/* --- Layout constants --- */
+#define SIDEBAR_W      48   /* team sidebar width */
+#define SIDEBAR_GAP    4    /* gap between main area and sidebar */
+#define DETAIL_SPRITE  48   /* detail view sprite size (was 64) */
+#define SIDE_SPRITE    32   /* sidebar sprite size */
+#define CELL_H         40   /* sidebar cell height (240/6) */
+#define TOP_OFFSET     2    /* vertical offset for main content area */
+#define TEXT_DROP      12   /* push text rows down within top panel */
 
 #define POKEMON_SLOT_SIZE 100
 #define MAX_PARTY         6
 
-/* --- Overlay state: current party slot index (0..5) --- */
-static int sOverlayMode = 0;
-static unsigned sPrevHeld = 0; /* for edge detection */
-static int sShowLearnset = 0;   /* 0 = current moves, 1 = learnset */
-static int sLearnsetScroll = 0; /* scroll offset within learnset */
+/* --- Overlay state --- */
+static int sOverlayMode = 0;       /* current party slot index (0..5) */
+static unsigned sPrevHeld = 0;     /* for edge detection */
+static int sShowLearnset = 0;      /* 0 = current moves, 1 = learnset */
+static int sLearnsetScroll = 0;    /* scroll offset within learnset */
+static int sShowIVEV = 0;          /* 0 = stats, 1 = IV/EV */
 
 /* ===================================================================
  *  Gen 3 substructure order table  (Bulbapedia canonical)
@@ -389,7 +402,67 @@ static int readLearnset(const uint8_t* rom, uint16_t species,
 }
 
 /* ===================================================================
+ *  TEAM SIDEBAR — 6 mini sprites stacked vertically on the right
+ * =================================================================== */
+static void drawTeamSidebar(struct GUIFont* font, const uint8_t* wram,
+                            const uint8_t* rom, uint8_t partyCount,
+                            int selected, int sideL, int sideR)
+{
+	int i;
+	int sideW = sideR - sideL;
+	(void)font;
+
+	for (i = 0; i < MAX_PARTY; i++) {
+		int cellY = i * CELL_H;
+		int sprX  = sideL + (sideW - SIDE_SPRITE) / 2;
+		int sprY  = cellY + 3;
+
+		if (i < partyCount) {
+			struct PokeSlot pk;
+			if (readSlot(wram, rom, i, &pk)) {
+				uint32_t borderClr = (i == selected) ? UI_ACCENT : UI_BORDER;
+
+				/* Cell: border then fill */
+				drawRect(sideL, cellY, sideW, CELL_H, borderClr);
+				drawRect(sideL + 1, cellY + 1, sideW - 2, CELL_H - 2,
+				         (i == selected) ? UI_SEL_BG : UI_PANEL);
+
+				/* 32x32 sprite */
+				drawPokemonSprite(rom, pk.species, sprX, sprY,
+				                  SIDE_SPRITE, SIDE_SPRITE);
+
+				/* HP bar: 2px tall below sprite */
+				{
+					int barW = SIDE_SPRITE;
+					int barX = sprX;
+					int barY = sprY + SIDE_SPRITE + 1;
+					int fillW;
+
+					drawRect(barX, barY, barW, 2, 0xFF202020);
+					if (pk.maxHP > 0) {
+						fillW = (pk.curHP * barW) / pk.maxHP;
+						if (fillW > barW) fillW = barW;
+						if (fillW > 0)
+							drawRect(barX, barY, fillW, 2,
+							         hpColor(pk.curHP, pk.maxHP));
+					}
+				}
+			} else {
+				/* Invalid slot: dim cell */
+				drawRect(sideL, cellY, sideW, CELL_H, UI_BORDER);
+				drawRect(sideL + 1, cellY + 1, sideW - 2, CELL_H - 2, UI_PANEL);
+			}
+		} else {
+			/* Empty slot beyond party */
+			drawRect(sideL, cellY, sideW, CELL_H, UI_BORDER);
+			drawRect(sideL + 1, cellY + 1, sideW - 2, CELL_H - 2, UI_PANEL);
+		}
+	}
+}
+
+/* ===================================================================
  *  DETAIL VIEW — single Pokemon deep dive (PMD-style framed panels)
+ *  panelR is the right edge of the main content area (excludes sidebar)
  * =================================================================== */
 static void drawDetail(struct GUIFont* font, const uint8_t* wram,
                        const uint8_t* rom, int slotIndex, uint8_t partyCount,
@@ -417,25 +490,26 @@ static void drawDetail(struct GUIFont* font, const uint8_t* wram,
 	}
 
 	panelL = padX;
-	panelR = screenW - padX;
+	panelR = screenW - padX - SIDEBAR_W - SIDEBAR_GAP;
 	panelW = panelR - panelL;
 	inset  = 6;
 	sprX   = panelL + inset;
-	sprY   = padY + inset;
-	textX  = sprX + 64 + 8;
+	sprY   = TOP_OFFSET + inset;
+	textX  = sprX + DETAIL_SPRITE + 6;
 	textR  = panelR - inset;
 
-	/* === TOP PANEL: sprite + basic info === */
-	topH = 64 + inset * 2;
-	drawRect(panelL - 2, padY - 2, panelW + 4, topH + 4, UI_BORDER);
-	drawRect(panelL, padY, panelW, topH, UI_PANEL);
+	/* === TOP PANEL: sprite + basic info (shifted down 16px) === */
+	topH = DETAIL_SPRITE + inset * 2;
+	drawRect(panelL - 2, TOP_OFFSET - 2, panelW + 4, topH + 4, UI_BORDER);
+	drawRect(panelL, TOP_OFFSET, panelW, topH, UI_PANEL);
 
 	/* Sprite frame + sprite (top-left) */
-	drawRect(sprX - 2, sprY - 2, 68, 68, UI_ACCENT);
-	drawPokemonSprite(rom, pk.species, sprX, sprY, 1);
+	drawRect(sprX - 2, sprY - 2, DETAIL_SPRITE + 4, DETAIL_SPRITE + 4, UI_ACCENT);
+	drawPokemonSprite(rom, pk.species, sprX, sprY,
+	                  DETAIL_SPRITE, DETAIL_SPRITE);
 
-	/* Rows 1-3: vertically centered beside 64px sprite */
-	y = sprY + (64 - lineH * 3) / 2;
+	/* Rows 1-3: beside sprite, shifted down for breathing room */
+	y = sprY + (DETAIL_SPRITE - lineH * 3) / 2 + TEXT_DROP;
 
 	/* Row 1: species [status] + gym leader name */
 	{
@@ -467,63 +541,75 @@ static void drawDetail(struct GUIFont* font, const uint8_t* wram,
 	              hpColor(pk.curHP, pk.maxHP),
 	              "HP %u/%u", pk.curHP, pk.maxHP);
 
-	/* === STATS PANEL (2 rows: stats left, IV/EV right) === */
-	y = padY + topH + 6;
+	/* === STATS PANEL (toggleable: stats or IV/EV) === */
+	y = TOP_OFFSET + topH + 3;
 	{
-		int statsH = lineH * 2 + 24;
+		int statsH = lineH * 2 + 18 + TEXT_DROP;
 		drawRect(panelL - 2, y - 2, panelW + 4, statsH + 4, UI_BORDER);
 		drawRect(panelL, y, panelW, statsH, UI_PANEL);
-		y += 12;
+		y += 8 + TEXT_DROP;
 
-		{
-			char sbuf[16];
-			int sx = panelL + inset;
+		if (!sShowIVEV) {
+			/* --- Stats view --- */
+			{
+				char sbuf[16];
+				int sx = panelL + inset;
 
-			snprintf(sbuf, sizeof(sbuf), "Atk:%-3u ", pk.atk);
-			GUIFontPrintf(font, sx, y, GUI_ALIGN_LEFT, natureStatColor(pk.nature, 0), "%s", sbuf);
-			sx += GUIFontSpanWidth(font, sbuf);
+				snprintf(sbuf, sizeof(sbuf), "Atk:%-3u ", pk.atk);
+				GUIFontPrintf(font, sx, y, GUI_ALIGN_LEFT, natureStatColor(pk.nature, 0), "%s", sbuf);
+				sx += GUIFontSpanWidth(font, sbuf);
 
-			snprintf(sbuf, sizeof(sbuf), "Def:%-3u ", pk.def);
-			GUIFontPrintf(font, sx, y, GUI_ALIGN_LEFT, natureStatColor(pk.nature, 1), "%s", sbuf);
-			sx += GUIFontSpanWidth(font, sbuf);
+				snprintf(sbuf, sizeof(sbuf), "Def:%-3u ", pk.def);
+				GUIFontPrintf(font, sx, y, GUI_ALIGN_LEFT, natureStatColor(pk.nature, 1), "%s", sbuf);
+				sx += GUIFontSpanWidth(font, sbuf);
 
-			GUIFontPrintf(font, sx, y, GUI_ALIGN_LEFT, natureStatColor(pk.nature, 2), "Spe:%u", pk.spe);
+				GUIFontPrintf(font, sx, y, GUI_ALIGN_LEFT, natureStatColor(pk.nature, 2), "Spe:%u", pk.spe);
+			}
+			GUIFontPrintf(font, panelR - inset, y, GUI_ALIGN_RIGHT, CLR_HEADER,
+			              "[IV/EV]");
+			y += lineH;
+
+			{
+				char sbuf[16];
+				int sx = panelL + inset;
+
+				snprintf(sbuf, sizeof(sbuf), "SpA:%-3u ", pk.spa);
+				GUIFontPrintf(font, sx, y, GUI_ALIGN_LEFT, natureStatColor(pk.nature, 3), "%s", sbuf);
+				sx += GUIFontSpanWidth(font, sbuf);
+
+				GUIFontPrintf(font, sx, y, GUI_ALIGN_LEFT, natureStatColor(pk.nature, 4), "SpD:%u", pk.spd);
+			}
+			y += lineH + 3;
+		} else {
+			/* --- IV/EV view --- */
+			GUIFontPrintf(font, panelL + inset, y, GUI_ALIGN_LEFT, CLR_GRAY,
+			              "IV %u/%u/%u/%u/%u/%u",
+			              pk.ivHP, pk.ivAtk, pk.ivDef, pk.ivSpe, pk.ivSpA, pk.ivSpD);
+			GUIFontPrintf(font, panelR - inset, y, GUI_ALIGN_RIGHT, CLR_HEADER,
+			              "[Stats]");
+			y += lineH;
+
+			GUIFontPrintf(font, panelL + inset, y, GUI_ALIGN_LEFT, CLR_GRAY,
+			              "EV %u/%u/%u/%u/%u/%u",
+			              pk.evHP, pk.evAtk, pk.evDef, pk.evSpe, pk.evSpA, pk.evSpD);
+			y += lineH + 3;
 		}
-		GUIFontPrintf(font, panelR - inset, y, GUI_ALIGN_RIGHT, CLR_GRAY,
-		              "IV %u/%u/%u/%u/%u/%u",
-		              pk.ivHP, pk.ivAtk, pk.ivDef, pk.ivSpe, pk.ivSpA, pk.ivSpD);
-		y += lineH;
-
-		{
-			char sbuf[16];
-			int sx = panelL + inset;
-
-			snprintf(sbuf, sizeof(sbuf), "SpA:%-3u ", pk.spa);
-			GUIFontPrintf(font, sx, y, GUI_ALIGN_LEFT, natureStatColor(pk.nature, 3), "%s", sbuf);
-			sx += GUIFontSpanWidth(font, sbuf);
-
-			GUIFontPrintf(font, sx, y, GUI_ALIGN_LEFT, natureStatColor(pk.nature, 4), "SpD:%u", pk.spd);
-		}
-		GUIFontPrintf(font, panelR - inset, y, GUI_ALIGN_RIGHT, CLR_GRAY,
-		              "EV %u/%u/%u/%u/%u/%u",
-		              pk.evHP, pk.evAtk, pk.evDef, pk.evSpe, pk.evSpA, pk.evSpD);
-		y += lineH + 3;
 	}
 
-	/* === MOVES PANEL === */
-	y += 4;
+	/* === MOVES PANEL (fills remaining height) === */
+	y += 3;
 	{
 		int movesY = y;
-		int movesH = lineH * 5 + 26;
+		int movesH = 240 - movesY;
 		drawRect(panelL - 2, movesY - 2, panelW + 4, movesH + 4, UI_BORDER);
 		drawRect(panelL, movesY, panelW, movesH, UI_PANEL);
-		y += 13;
+		y += 10 + TEXT_DROP;
 
 		if (sShowLearnset) {
 			GUIFontPrintf(font, panelL + inset, y, GUI_ALIGN_LEFT,
 			              CLR_HEADER, "LEARNSET");
 			GUIFontPrintf(font, panelR - inset, y, GUI_ALIGN_RIGHT,
-			              CLR_DARK, "Y: scroll");
+			              CLR_HEADER, "[Moves]");
 			y += lineH;
 
 			learnTotal = readLearnset(rom, pk.species, learnset, 32);
@@ -560,6 +646,8 @@ static void drawDetail(struct GUIFont* font, const uint8_t* wram,
 		} else {
 			GUIFontPrintf(font, panelL + inset, y, GUI_ALIGN_LEFT,
 			              CLR_HEADER, "MOVES");
+			GUIFontPrintf(font, panelR - inset, y, GUI_ALIGN_RIGHT,
+			              CLR_HEADER, "[Learnset]");
 			y += lineH;
 
 			for (m = 0; m < 4; m++) {
@@ -574,11 +662,6 @@ static void drawDetail(struct GUIFont* font, const uint8_t* wram,
 		}
 	}
 
-	/* === FOOTER (outside panels) === */
-	GUIFontPrintf(font, panelL, 240 - padY, GUI_ALIGN_LEFT, CLR_DARK,
-	              "[%d/%u]", slotIndex + 1, partyCount);
-	GUIFontPrintf(font, panelR, 240 - padY, GUI_ALIGN_RIGHT,
-	              CLR_HEADER, sShowLearnset ? "[Moves]" : "[Learnset]");
 }
 
 /* ===================================================================
@@ -595,6 +678,7 @@ void overlayDraw(struct mGUIRunner* runner, struct GUIFont* font,
 	uint8_t partyCount;
 	int nextBadge;
 	int lineH, padX, padY;
+	int sideL, sideR;
 
 	(void)screenH;
 
@@ -617,9 +701,13 @@ void overlayDraw(struct mGUIRunner* runner, struct GUIFont* font,
 		}
 	}
 
-	padX = 12;
+	padX = 6;
 	padY = 8;
 	lineH = GUIFontHeight(font) + 2;
+
+	/* Sidebar bounds */
+	sideR = screenW - padX;
+	sideL = sideR - SIDEBAR_W;
 
 	partyCount = wram[romprofileGet()->partyCount];
 	if (partyCount > MAX_PARTY) partyCount = MAX_PARTY;
@@ -646,14 +734,37 @@ void overlayDraw(struct mGUIRunner* runner, struct GUIFont* font,
 		if (pressed & KEY_TOUCH) {
 			touchPosition touch;
 			hidTouchRead(&touch);
-			if (touch.px > (unsigned)(screenW / 2) && touch.py > 200) {
-				sShowLearnset = !sShowLearnset;
-				sLearnsetScroll = 0;
+
+			if (touch.px > (unsigned)sideL) {
+				/* Sidebar touch: select party member */
+				int slot = touch.py / CELL_H;
+				if (slot >= 0 && slot < partyCount) {
+					sOverlayMode = slot;
+					sLearnsetScroll = 0;
+				}
 			} else {
-				sOverlayMode++;
-				if (sOverlayMode >= partyCount)
-					sOverlayMode = 0;
-				sLearnsetScroll = 0;
+				/* Touch zone math (mirrors drawDetail layout) */
+				int topH = DETAIL_SPRITE + 12; /* inset*2 */
+				int statsY = TOP_OFFSET + topH + 3;
+				int statsH = lineH * 2 + 18 + TEXT_DROP;
+				int movesY = statsY + statsH + 3;
+
+				if (touch.py >= (unsigned)statsY &&
+				    touch.py < (unsigned)(statsY + statsH)) {
+					sShowIVEV = !sShowIVEV;
+				}
+				/* Moves panel: toggle moves/learnset */
+				else if (touch.py >= (unsigned)movesY) {
+					sShowLearnset = !sShowLearnset;
+					sLearnsetScroll = 0;
+				}
+				/* Top panel: cycle to next */
+				else if (touch.py < (unsigned)(TOP_OFFSET + topH)) {
+					sOverlayMode++;
+					if (sOverlayMode >= partyCount)
+						sOverlayMode = 0;
+					sLearnsetScroll = 0;
+				}
 			}
 		}
 
@@ -681,9 +792,13 @@ void overlayDraw(struct mGUIRunner* runner, struct GUIFont* font,
 	if (sOverlayMode >= partyCount)
 		sOverlayMode = 0;
 
-	/* --- Always detail view --- */
+	/* --- Draw detail view (main area) --- */
 	drawDetail(font, wram, rom, sOverlayMode, partyCount,
 	           nextBadge, screenW, padX, padY, lineH);
+
+	/* --- Draw team sidebar (right edge) --- */
+	drawTeamSidebar(font, wram, rom, partyCount,
+	                sOverlayMode, sideL, sideR);
 #else
 	(void)runner;
 	GUIFontPrintf(font, screenW / 2, screenH / 2,
